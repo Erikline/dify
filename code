@@ -13,98 +13,83 @@ app.config['JSON_AS_ASCII'] = False
 DIFY_API_KEY = 'app-lZdOEsax5WX5qaNXqTWxpqHi'
 DIFY_API_BASE_URL = 'http://192.168.125.223/v1'
 
-def call_dify_stream(tender_file_bytes, bidding_chunk, user_id):
+def upload_file_to_dify(tender_file_bytes, user_id):
     """
-    以 multipart/form-data 的形式调用小 Dify 流的 API，上传文件。
+    上传文件到 Dify 并返回文件信息。
     """
     url = f"{DIFY_API_BASE_URL}/files/upload"
-
-    headers = {
-        'Authorization': f'Bearer {DIFY_API_KEY}',
-    }
-
-    files = {
-        'file': ('tender_file.docx', tender_file_bytes, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-    }
-
-    data = {
-        'user': user_id
-    }
+    headers = {'Authorization': f'Bearer {DIFY_API_KEY}'}
+    files = {'file': ('tender_file.docx', tender_file_bytes, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+    data = {'user': user_id}
 
     try:
-        # 第一步：上传文件
-        upload_response = requests.post(url, headers=headers, files=files, data=data)
-        upload_response.raise_for_status()
-        uploaded_file_data = upload_response.json()
+        response = requests.post(url, headers=headers, files=files, data=data)
+        response.raise_for_status()
+        uploaded_file_data = response.json()
         print("--- Dify Upload Response ---")
         print(json.dumps(uploaded_file_data, indent=2, ensure_ascii=False))
         print("----------------------------")
+        return uploaded_file_data
+    except requests.exceptions.RequestException as e:
+        print(f"!!! Dify File Upload Error: {e}")
+        error_body = e.response.text if e.response else 'No response body'
+        print(f"Response Body: {error_body}")
+        return None
 
-        dify_user_id = uploaded_file_data['created_by']
-
-        # 第二步：使用上传的文件 ID 和 bidding_chunk 调用 chat-messages
-        chat_url = f"{DIFY_API_BASE_URL}/chat-messages"
-        chat_headers = {
-            'Authorization': f'Bearer {DIFY_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        chat_data = {
-            "inputs": {
-                "tender_file": {
-                    "type": "document",
-                    "transfer_method": "local_file",
-                    "upload_file_id": uploaded_file_data['id']
-                },
-                "bidding_chunk": bidding_chunk
+def call_dify_chat_stream(upload_file_id, dify_user_id, bidding_chunk):
+    """
+    使用上传的文件 ID 和文本块调用 Dify 的 chat-messages 接口。
+    """
+    chat_url = f"{DIFY_API_BASE_URL}/chat-messages"
+    chat_headers = {
+        'Authorization': f'Bearer {DIFY_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    chat_data = {
+        "inputs": {
+            "tender_file": {
+                "type": "document",
+                "transfer_method": "local_file",
+                "upload_file_id": upload_file_id
             },
-            "query": "开始",
-            "response_mode": "blocking",
-            "user": dify_user_id
-        }
+            "bidding_chunk": bidding_chunk
+        },
+        "query": "开始",
+        "response_mode": "streaming",
+        "user": dify_user_id
+    }
 
-        print(f"--- Calling Dify Chat API (Final Corrected Structure) ---")
-        print(json.dumps(chat_data, indent=2, ensure_ascii=False))
-        print("-----------------------------------------------------------")
+    try:
+        print(f"--- Calling Dify Chat API for chunk ---")
+        # print(json.dumps(chat_data, indent=2, ensure_ascii=False))
+        print("---------------------------------------")
 
-        chat_response = requests.post(chat_url, headers=chat_headers, json=chat_data)
+        chat_response = requests.post(chat_url, headers=chat_headers, json=chat_data, stream=True, timeout=300)
         chat_response.raise_for_status()
 
-        # Since response_mode is 'blocking', the response is a single JSON object.
-        response_data = chat_response.json()
-        print("--- Dify Blocking Response ---")
-        print(json.dumps(response_data, indent=2, ensure_ascii=False))
-        print("------------------------------")
-
-        # Extract the actual answer from the response
-        answer = response_data.get('answer', '')
+        full_answer = ""
+        for line in chat_response.iter_lines():
+            if line:
+                decoded_line = line.decode('utf-8')
+                if decoded_line.startswith('data:'):
+                    try:
+                        json_data_str = decoded_line[len('data:'):].strip()
+                        if json_data_str.startswith('{'):
+                            json_data = json.loads(json_data_str)
+                            if 'answer' in json_data:
+                                full_answer += json_data['answer']
+                    except json.JSONDecodeError:
+                        print(f"Could not decode JSON from line: {decoded_line}")
         
-        return {"bidding_chunk": bidding_chunk, "result": answer}
+        return {"bidding_chunk": bidding_chunk, "result": full_answer}
 
     except requests.exceptions.RequestException as e:
-        print(f"!!! Dify API Error: {e}")
+        print(f"!!! Dify Chat API Error: {e}")
         error_body = e.response.text if e.response else 'No response body'
         print(f"Response Body: {error_body}")
         return {"bidding_chunk": bidding_chunk, "error": str(e), "details": error_body}
 
-def parse_markdown_to_chunks(markdown_content):
-    """
-    将 Markdown 内容按一级标题（#）拆分为段落。
-    每个段落包含一个一级标题及其下的所有内容（包括子标题）。
-    """
-    chunks = []
-    current_chunk_lines = []
-    lines = markdown_content.split('\n')
-    for line in lines:
-        if line.startswith('# ') and not line.startswith('##'):
-            if current_chunk_lines:
-                chunks.append("\n".join(current_chunk_lines).strip())
-            current_chunk_lines = [line]
-        else:
-            current_chunk_lines.append(line)
-    if current_chunk_lines:
-        chunks.append("\n".join(current_chunk_lines).strip())
-    # 过滤掉可能产生的空块
-    return [chunk for chunk in chunks if chunk]
+
 
 @app.route('/upload_and_process', methods=['POST'])
 def upload_and_process():
@@ -120,24 +105,37 @@ def upload_and_process():
     tender_file_bytes = tender_file.read()
     bidding_file_bytes = bidding_file.read()
     try:
-        bidding_file_content = bidding_file_bytes.decode('utf-8')
+        bidding_file_content = bidding_file_bytes.decode('utf-8-sig')
     except UnicodeDecodeError:
         bidding_file_content = bidding_file_bytes.decode('gbk', errors='replace')
 
-    # 1. 解析 Markdown 文件
-    bidding_chunks = parse_markdown_to_chunks(bidding_file_content)
+    # 1. 使用正则表达式按 "## " 分割文件内容
+    chunks = re.split(r'(^## .+$)', bidding_file_content, flags=re.MULTILINE)
+    
+    bidding_chunks = []
+    if chunks[0].strip():
+        bidding_chunks.append(chunks[0].strip())
+    
+    for i in range(1, len(chunks), 2):
+        chunk_content = chunks[i] + chunks[i+1]
+        bidding_chunks.append(chunk_content.strip())
 
-    # 2. 并行调用 Dify API
-    user_id = "user123" # 您可以根据需要生成或获取用户 ID
+    # 2. 上传一次 tender_file
+    user_id = "user123"
+    uploaded_file_data = upload_file_to_dify(tender_file_bytes, user_id)
+    if not uploaded_file_data:
+        return jsonify({"error": "Failed to upload tender file to Dify"}), 500
+
+    upload_file_id = uploaded_file_data['id']
+    dify_user_id = uploaded_file_data['created_by']
+
+    # 3. 串行调用 Dify Chat API
     results = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        # 为每个 chunk 创建一个 future
-        futures = [executor.submit(call_dify_stream, tender_file_bytes, chunk, user_id) for chunk in bidding_chunks]
-        
-        for future in concurrent.futures.as_completed(futures):
-            results.append(future.result())
-
-    # 3. 返回结果
+    for i, chunk in enumerate(bidding_chunks):
+        print(f"--- Processing chunk {i+1}/{len(bidding_chunks)} ---")
+        result = call_dify_chat_stream(upload_file_id, dify_user_id, chunk)
+        results.append(result)
+        print(f"--- Finished chunk {i+1}/{len(bidding_chunks)} ---")
     json_response = json.dumps(results, ensure_ascii=False)
     return Response(json_response, content_type='application/json; charset=utf-8')
 
