@@ -1,51 +1,79 @@
-
 import os
 import re
 import json
+import time
 import requests
+import logging
 import concurrent.futures
+from waitress import serve
 from flask import Flask, request, Response, jsonify
 
-app = Flask(__name__)
-app.config['JSON_AS_ASCII'] = False
+# 1. 配置管理
+class Config:
+    """应用配置类"""
+    JSON_AS_ASCII = False
+    
+    # Dify 配置 (从环境变量获取，提供默认值)
+    DIFY_API_KEY = os.environ.get('DIFY_API_KEY', 'app-PO6iEOSJHJ9RkSnKEE0nDrXJ')
+    DIFY_API_BASE_URL = os.environ.get('DIFY_API_BASE_URL', 'http://192.168.125.223/v1')
 
-# 小 Dify 流的配置
-DIFY_API_KEY = 'app-lZdOEsax5WX5qaNXqTWxpqHi'
-DIFY_API_BASE_URL = 'http://192.168.125.223/v1'
+    # 并行和重试配置
+    MAX_RETRIES = int(os.environ.get('MAX_RETRIES', 10))
+    MAX_WORKERS = int(os.environ.get('MAX_WORKERS', 5))
+    REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 300))
+    RETRY_DELAY = int(os.environ.get('RETRY_DELAY', 1))
+
+    # Flask 应用配置
+    APP_HOST = os.environ.get('APP_HOST', '0.0.0.0')
+    APP_PORT = int(os.environ.get('APP_PORT', 8748))
+
+# 2. 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# 3. 初始化 Flask 应用
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# 4. 创建一个全局的 requests.Session 以提高性能
+# Session 会自动处理 Keep-Alive，重用连接
+http_session = requests.Session()
+http_session.headers.update({'Authorization': f'Bearer {app.config["DIFY_API_KEY"]}'})
+
 
 def upload_file_to_dify(tender_file_bytes, user_id):
     """
     上传文件到 Dify 并返回文件信息。
     """
-    url = f"{DIFY_API_BASE_URL}/files/upload"
-    headers = {'Authorization': f'Bearer {DIFY_API_KEY}'}
+    url = f"{app.config['DIFY_API_BASE_URL']}/files/upload"
     files = {'file': ('tender_file.docx', tender_file_bytes, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
     data = {'user': user_id}
 
     try:
-        response = requests.post(url, headers=headers, files=files, data=data)
+        # 使用全局 session 发送请求
+        response = http_session.post(url, files=files, data=data, timeout=app.config['REQUEST_TIMEOUT'])
         response.raise_for_status()
         uploaded_file_data = response.json()
-        print("--- Dify Upload Response ---")
-        print(json.dumps(uploaded_file_data, indent=2, ensure_ascii=False))
-        print("----------------------------")
+        logger.info("Dify file upload successful. File ID: %s", uploaded_file_data.get('id'))
         return uploaded_file_data
     except requests.exceptions.RequestException as e:
-        print(f"!!! Dify File Upload Error: {e}")
         error_body = e.response.text if e.response else 'No response body'
-        print(f"Response Body: {error_body}")
+        logger.error("Dify file upload failed: %s. Response: %s", e, error_body)
         return None
 
-def call_dify_chat_stream(upload_file_id, dify_user_id, bidding_chunk):
+
+def call_dify_workflow(upload_file_id, dify_user_id, bidding_chunk):
     """
-    使用上传的文件 ID 和文本块调用 Dify 的 chat-messages 接口。
+    使用上传的文件 ID 和文本块调用 Dify 的工作流。
     """
-    chat_url = f"{DIFY_API_BASE_URL}/chat-messages"
-    chat_headers = {
-        'Authorization': f'Bearer {DIFY_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    chat_data = {
+    workflow_url = f"{app.config['DIFY_API_BASE_URL']}/workflows/run"
+    # Session 已经包含了 Authorization，这里只需要添加 Content-Type
+    headers = {'Content-Type': 'application/json'}
+    data = {
         "inputs": {
             "tender_file": {
                 "type": "document",
@@ -54,74 +82,108 @@ def call_dify_chat_stream(upload_file_id, dify_user_id, bidding_chunk):
             },
             "bidding_chunk": bidding_chunk
         },
-        "query": "开始",
         "response_mode": "streaming",
         "user": dify_user_id
     }
 
     try:
-        print(f"--- Calling Dify Chat API for chunk ---")
-        # print(json.dumps(chat_data, indent=2, ensure_ascii=False))
-        print("---------------------------------------")
+        chunk_preview = bidding_chunk.strip().replace('\n', ' ')[:100] + "..."
+        logger.info("Calling Dify workflow for chunk. Preview: %s", chunk_preview)
 
-        chat_response = requests.post(chat_url, headers=chat_headers, json=chat_data, stream=True, timeout=300)
-        chat_response.raise_for_status()
+        response = http_session.post(
+            workflow_url, 
+            headers=headers, 
+            json=data, 
+            stream=True, 
+            timeout=app.config['REQUEST_TIMEOUT']
+        )
+        response.raise_for_status()
 
+        all_events = []
         full_answer = ""
-        for line in chat_response.iter_lines():
-            if line:
-                decoded_line = line.decode('utf-8')
-                if decoded_line.startswith('data:'):
-                    try:
-                        json_data_str = decoded_line[len('data:'):].strip()
-                        if json_data_str.startswith('{'):
-                            json_data = json.loads(json_data_str)
-                            if 'answer' in json_data:
-                                full_answer += json_data['answer']
-                    except json.JSONDecodeError:
-                        print(f"Could not decode JSON from line: {decoded_line}")
+        try:
+            for line in response.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    if decoded_line.startswith('data:'):
+                        try:
+                            json_data_str = decoded_line[len('data:'):].strip()
+                            if json_data_str:
+                                json_data = json.loads(json_data_str)
+                                all_events.append(json_data)
+                        except json.JSONDecodeError:
+                            logger.warning("Could not decode JSON from line: %s", decoded_line)
+        finally:
+            response.close()
+
+        # 从事件中提取最终答案
+        for event in all_events:
+            if event.get('event') == 'workflow_finished':
+                outputs = event.get('data', {}).get('outputs', {})
+                if outputs and isinstance(outputs, dict):
+                    full_answer = next(iter(outputs.values()), "")
+                    if full_answer:
+                        break
+        
+        if not full_answer:
+            for event in reversed(all_events):
+                outputs = None
+                if event.get('event') == 'node_finished' and event.get('data', {}).get('node_type') == 'end':
+                    outputs = event.get('data', {}).get('outputs', {})
+                elif event.get('event') in ('agent_message', 'message'):
+                    outputs = event.get('data', {}).get('outputs', {})
+                
+                if outputs and isinstance(outputs, dict):
+                    potential_answer = next(iter(outputs.values()), "")
+                    if potential_answer:
+                        full_answer = potential_answer
+                        break
         
         return {"bidding_chunk": bidding_chunk, "result": full_answer}
 
     except requests.exceptions.RequestException as e:
-        print(f"!!! Dify Chat API Error: {e}")
         error_body = e.response.text if e.response else 'No response body'
-        print(f"Response Body: {error_body}")
+        logger.error("Dify workflow call failed: %s. Response: %s", e, error_body)
         return {"bidding_chunk": bidding_chunk, "error": str(e), "details": error_body}
-
 
 
 @app.route('/upload_and_process', methods=['POST'])
 def upload_and_process():
     """
-    接收上传的文件，处理后调用 Dify API。
+    接收上传的文件，分块处理后调用 Dify API。
     """
     if 'tender_file' not in request.files or 'bidding_file' not in request.files:
+        logger.warning("Upload attempt failed: Missing tender_file or bidding_file.")
         return jsonify({"error": "Missing tender_file or bidding_file"}), 400
 
     tender_file = request.files['tender_file']
     bidding_file = request.files['bidding_file']
+    logger.info("Received files: tender_file=%s, bidding_file=%s", tender_file.filename, bidding_file.filename)
 
     tender_file_bytes = tender_file.read()
     bidding_file_bytes = bidding_file.read()
     try:
         bidding_file_content = bidding_file_bytes.decode('utf-8-sig')
     except UnicodeDecodeError:
+        logger.warning("Failed to decode bidding_file as utf-8-sig, trying gbk.")
         bidding_file_content = bidding_file_bytes.decode('gbk', errors='replace')
 
-    # 1. 使用正则表达式按 "## " 分割文件内容
-    chunks = re.split(r'(^## .+$)', bidding_file_content, flags=re.MULTILINE)
-    
+    # 1. 根据 "### " 分割文件内容
+    chunks = re.split(r'(^### .+$)', bidding_file_content, flags=re.MULTILINE)
     bidding_chunks = []
-    if chunks[0].strip():
+    if chunks and chunks[0].strip():
         bidding_chunks.append(chunks[0].strip())
-    
-    for i in range(1, len(chunks), 2):
-        chunk_content = chunks[i] + chunks[i+1]
-        bidding_chunks.append(chunk_content.strip())
+    if len(chunks) > 1:
+        for i in range(1, len(chunks), 2):
+            if i + 1 < len(chunks):
+                chunk_content = chunks[i] + chunks[i+1]
+                bidding_chunks.append(chunk_content.strip())
+            else:
+                bidding_chunks.append(chunks[i].strip())
+    logger.info("Split bidding file into %d chunks.", len(bidding_chunks))
 
     # 2. 上传一次 tender_file
-    user_id = "user123"
+    user_id = "user123" # TODO: 考虑从请求中获取真实用户ID
     uploaded_file_data = upload_file_to_dify(tender_file_bytes, user_id)
     if not uploaded_file_data:
         return jsonify({"error": "Failed to upload tender file to Dify"}), 500
@@ -129,15 +191,68 @@ def upload_and_process():
     upload_file_id = uploaded_file_data['id']
     dify_user_id = uploaded_file_data['created_by']
 
-    # 3. 串行调用 Dify Chat API
-    results = []
-    for i, chunk in enumerate(bidding_chunks):
-        print(f"--- Processing chunk {i+1}/{len(bidding_chunks)} ---")
-        result = call_dify_chat_stream(upload_file_id, dify_user_id, chunk)
-        results.append(result)
-        print(f"--- Finished chunk {i+1}/{len(bidding_chunks)} ---")
-    json_response = json.dumps(results, ensure_ascii=False)
-    return Response(json_response, content_type='application/json; charset=utf-8')
+    # 3. 带重试机制的并行调用 Dify Workflow
+    results = [None] * len(bidding_chunks)
+    chunks_to_process = {i: {"chunk": chunk, "retries": 0} for i, chunk in enumerate(bidding_chunks)}
+
+    while chunks_to_process:
+        failed_chunks = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=app.config['MAX_WORKERS']) as executor:
+            future_to_index = {
+                executor.submit(call_dify_workflow, upload_file_id, dify_user_id, item["chunk"]): index 
+                for index, item in chunks_to_process.items()
+            }
+
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                original_chunk_item = chunks_to_process[index]
+                try:
+                    result = future.result()
+                    if "error" in result or not result.get("result"):
+                        error_message = result.get('details', result.get('error', 'Result was empty'))
+                        logger.warning("Chunk %d failed: %s", index, error_message)
+                        
+                        if original_chunk_item["retries"] < app.config['MAX_RETRIES']:
+                            original_chunk_item["retries"] += 1
+                            failed_chunks[index] = original_chunk_item
+                            logger.info("Scheduling chunk %d for retry (%d/%d)", index, original_chunk_item['retries'], app.config['MAX_RETRIES'])
+                        else:
+                            logger.error("Chunk %d failed after %d retries. Giving up.", index, app.config['MAX_RETRIES'])
+                            results[index] = result
+                    else:
+                        logger.info("Chunk %d completed successfully.", index)
+                        results[index] = result
+
+                except Exception as exc:
+                    logger.error("Chunk %d generated an exception: %s", index, exc, exc_info=True)
+                    if original_chunk_item["retries"] < app.config['MAX_RETRIES']:
+                        original_chunk_item["retries"] += 1
+                        failed_chunks[index] = original_chunk_item
+                        logger.info("Scheduling chunk %d for retry after exception (%d/%d)", index, original_chunk_item['retries'], app.config['MAX_RETRIES'])
+                    else:
+                        logger.error("Chunk %d failed after %d retries with exception. Giving up.", index, app.config['MAX_RETRIES'])
+                        results[index] = {"error": str(exc), "bidding_chunk": original_chunk_item["chunk"]}
+        
+        chunks_to_process = failed_chunks
+
+        if chunks_to_process:
+            logger.info("Waiting for %d second(s) before retrying %d failed chunks...", app.config['RETRY_DELAY'], len(chunks_to_process))
+            time.sleep(app.config['RETRY_DELAY'])
+
+    # 4. 拼接最终结果
+    final_pieces = []
+    for i, result_item in enumerate(results):
+        if result_item and "error" not in result_item and result_item.get("result"):
+            final_pieces.append(result_item["result"])
+        else:
+            logger.warning("Chunk %d failed or returned empty. Using original content as fallback.", i)
+            final_pieces.append(bidding_chunks[i])
+    
+    final_document = "\n\n".join(final_pieces)
+    logger.info("Successfully processed request. Returning final document of length %d.", len(final_document))
+
+    return Response(final_document, content_type='text/plain; charset=utf-8')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    logger.info("--- Starting server with waitress on http://%s:%s ---", app.config['APP_HOST'], app.config['APP_PORT'])
+    serve(app, host=app.config['APP_HOST'], port=app.config['APP_PORT'])
