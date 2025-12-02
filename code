@@ -193,51 +193,79 @@ def upload_and_process():
 
     # 3. 带重试机制的并行调用 Dify Workflow
     results = [None] * len(bidding_chunks)
-    chunks_to_process = {i: {"chunk": chunk, "retries": 0} for i, chunk in enumerate(bidding_chunks)}
 
-    while chunks_to_process:
-        failed_chunks = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=app.config['MAX_WORKERS']) as executor:
-            future_to_index = {
-                executor.submit(call_dify_workflow, upload_file_id, dify_user_id, item["chunk"]): index 
-                for index, item in chunks_to_process.items()
+    def call_with_delay(delay, func, *args, **kwargs):
+        """在调用函数前等待指定的秒数"""
+        time.sleep(delay)
+        return func(*args, **kwargs)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=app.config['MAX_WORKERS']) as executor:
+        future_to_info = {
+            executor.submit(call_dify_workflow, upload_file_id, dify_user_id, chunk): {
+                "index": i, "retries": 0, "chunk": chunk
             }
+            for i, chunk in enumerate(bidding_chunks)
+        }
 
-            for future in concurrent.futures.as_completed(future_to_index):
-                index = future_to_index[future]
-                original_chunk_item = chunks_to_process[index]
+        while future_to_info:
+            done, _ = concurrent.futures.wait(
+                future_to_info,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
+
+            for future in done:
+                info = future_to_info.pop(future)
+                index, retries, chunk = info["index"], info["retries"], info["chunk"]
+
                 try:
                     result = future.result()
-                    if "error" in result or not result.get("result"):
-                        error_message = result.get('details', result.get('error', 'Result was empty'))
-                        logger.warning("Chunk %d failed: %s", index, error_message)
-                        
-                        if original_chunk_item["retries"] < app.config['MAX_RETRIES']:
-                            original_chunk_item["retries"] += 1
-                            failed_chunks[index] = original_chunk_item
-                            logger.info("Scheduling chunk %d for retry (%d/%d)", index, original_chunk_item['retries'], app.config['MAX_RETRIES'])
-                        else:
-                            logger.error("Chunk %d failed after %d retries. Giving up.", index, app.config['MAX_RETRIES'])
-                            results[index] = result
-                    else:
+                    is_error = "error" in result or not result.get("result")
+
+                    if not is_error:
                         logger.info("Chunk %d completed successfully.", index)
+                        results[index] = result
+                        continue
+
+                    error_message = result.get('details', result.get('error', 'Result was empty'))
+                    logger.warning("Chunk %d failed: %s", index, error_message)
+                    
+                    if retries < app.config['MAX_RETRIES']:
+                        retry_count = retries + 1
+                        logger.info("Scheduling chunk %d for retry (%d/%d) after %d second(s) delay.", 
+                                    index, retry_count, app.config['MAX_RETRIES'], app.config['RETRY_DELAY'])
+                        
+                        new_future = executor.submit(
+                            call_with_delay,
+                            app.config['RETRY_DELAY'],
+                            call_dify_workflow,
+                            upload_file_id,
+                            dify_user_id,
+                            chunk
+                        )
+                        future_to_info[new_future] = {"index": index, "retries": retry_count, "chunk": chunk}
+                    else:
+                        logger.error("Chunk %d failed after %d retries. Giving up.", index, app.config['MAX_RETRIES'])
                         results[index] = result
 
                 except Exception as exc:
                     logger.error("Chunk %d generated an exception: %s", index, exc, exc_info=True)
-                    if original_chunk_item["retries"] < app.config['MAX_RETRIES']:
-                        original_chunk_item["retries"] += 1
-                        failed_chunks[index] = original_chunk_item
-                        logger.info("Scheduling chunk %d for retry after exception (%d/%d)", index, original_chunk_item['retries'], app.config['MAX_RETRIES'])
+                    if retries < app.config['MAX_RETRIES']:
+                        retry_count = retries + 1
+                        logger.info("Scheduling chunk %d for retry after exception (%d/%d) after %d second(s) delay.",
+                                    index, retry_count, app.config['MAX_RETRIES'], app.config['RETRY_DELAY'])
+                        
+                        new_future = executor.submit(
+                            call_with_delay,
+                            app.config['RETRY_DELAY'],
+                            call_dify_workflow,
+                            upload_file_id,
+                            dify_user_id,
+                            chunk
+                        )
+                        future_to_info[new_future] = {"index": index, "retries": retry_count, "chunk": chunk}
                     else:
                         logger.error("Chunk %d failed after %d retries with exception. Giving up.", index, app.config['MAX_RETRIES'])
-                        results[index] = {"error": str(exc), "bidding_chunk": original_chunk_item["chunk"]}
-        
-        chunks_to_process = failed_chunks
-
-        if chunks_to_process:
-            logger.info("Waiting for %d second(s) before retrying %d failed chunks...", app.config['RETRY_DELAY'], len(chunks_to_process))
-            time.sleep(app.config['RETRY_DELAY'])
+                        results[index] = {"error": str(exc), "bidding_chunk": chunk}
 
     # 4. 拼接最终结果
     final_pieces = []
