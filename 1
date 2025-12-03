@@ -149,59 +149,6 @@ def call_dify_workflow(upload_file_id, dify_user_id, bidding_chunk):
         return {"bidding_chunk": bidding_chunk, "error": str(e), "details": error_body}
 
 
-def semantic_split_and_process(file_content):
-    # 1. 先按 1-3级标题 彻底打散
-    # 这样保证了物理切割是正确的，不会出现包含关系错误
-    raw_chunks = re.split(r'(^#{1,3} .+$)', file_content, flags=re.MULTILINE)
-    
-    final_chunks = []
-    
-    # 上下文堆栈
-    last_h1 = ""
-    last_h2 = ""
-    
-    # 处理第一段（如果有前言）
-    if raw_chunks[0].strip():
-        final_chunks.append(raw_chunks[0].strip())
-        
-    for i in range(1, len(raw_chunks), 2):
-        header = raw_chunks[i].strip()
-        body = raw_chunks[i+1] if i+1 < len(raw_chunks) else ""
-        
-        # 判断标题级别
-        if header.startswith('### '):
-            # 这是一个三级标题
-            # 💡关键点：把当前的 父标题 拼接到前面，作为 Context
-            # 格式化为：
-            # # 第一章
-            # ## 1.1 节
-            # ### 1.1.1 小节 (当前内容)
-            context_prefix = ""
-            if last_h1: context_prefix += last_h1 + "\n"
-            if last_h2: context_prefix += last_h2 + "\n"
-            
-            chunk_content = f"{context_prefix}{header}{body}"
-            final_chunks.append(chunk_content)
-            
-        elif header.startswith('## '):
-            # 这是一个二级标题，更新上下文
-            last_h2 = header
-            # 如果进入新二级标题，根据你的需求，决定是否要清空 h1 (通常不需要，除非遇到新h1)
-            # 这种层级通常自己就是一个块
-            chunk_content = f"{last_h1 + '\n' if last_h1 else ''}{header}{body}"
-            final_chunks.append(chunk_content)
-            
-        elif header.startswith('# '):
-            # 这是一个一级标题，更新上下文，清空二级上下文
-            last_h1 = header
-            last_h2 = "" # 新章开始，旧节失效
-            
-            chunk_content = f"{header}{body}"
-            final_chunks.append(chunk_content)
-            
-    return final_chunks
-
-
 @app.route('/upload_and_process', methods=['POST'])
 def upload_and_process():
     """
